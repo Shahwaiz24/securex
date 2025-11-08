@@ -241,9 +241,12 @@ class OptimizedGCM {
         const h = OptimizedAES.encryptBlock(zeroBlock, expandedKey);
         MemoryPool.returnBuffer(zeroBlock);
 
+        // Initialize counter: J0 = IV || 0^31 || 1, then use J0+1, J0+2, etc. for encryption
         const counter = MemoryPool.getBuffer(16);
-        counter.set(iv);
-        counter[15] = 1;
+        counter.fill(0); // Initialize to zeros first
+        counter.set(iv, 0); // First 12 bytes = IV
+        // Bytes 12-14 are already 0 from fill(0)
+        counter[15] = 2; // Start at J0+1 = IV || 0 || 0 || 0 || 2 (first block uses counter 2)
 
         const encrypted = MemoryPool.getBuffer(data.length);
         for (let i = 0; i < data.length; i += 16) {
@@ -259,11 +262,87 @@ class OptimizedGCM {
         }
 
         const tag = this.ghash(h, new Uint8Array(0), encrypted);
+
+        // Finalize tag with J0 encryption (J0 = IV || 0^31 || 1 for 96-bit IV)
+        const j0 = MemoryPool.getBuffer(16);
+        j0.fill(0); // Initialize to zeros first
+        j0.set(iv, 0); // First 12 bytes = IV
+        // Bytes 12-14 are already 0 from fill(0)
+        j0[15] = 1; // Last byte = 1 (J0 for 96-bit IV)
+        const tagBlock = OptimizedAES.encryptBlock(j0, expandedKey);
+        for (let i = 0; i < 16; i++) {
+            tag[i] ^= tagBlock[i];
+        }
+        MemoryPool.returnBuffer(tagBlock);
+        MemoryPool.returnBuffer(j0);
         MemoryPool.returnBuffer(counter);
         MemoryPool.returnBuffer(expandedKey);
         MemoryPool.returnBuffer(h);
 
         return { encrypted, tag };
+    }
+
+    static decrypt(encrypted: Uint8Array, key: Uint8Array, iv: Uint8Array, expectedTag: Uint8Array): Uint8Array {
+        const expandedKey = OptimizedAES.expandKey(key);
+        const zeroBlock = MemoryPool.getBuffer(16);
+        zeroBlock.fill(0);
+        const h = OptimizedAES.encryptBlock(zeroBlock, expandedKey);
+        MemoryPool.returnBuffer(zeroBlock);
+
+        // Verify tag first before decrypting
+        const computedTag = this.ghash(h, new Uint8Array(0), encrypted);
+
+        // Use J0 (J0 = IV || 0^31 || 1 for 96-bit IV) for tag encryption
+        const j0 = MemoryPool.getBuffer(16);
+        j0.fill(0); // Initialize to zeros first
+        j0.set(iv, 0); // First 12 bytes = IV
+        // Bytes 12-14 are already 0 from fill(0)
+        j0[15] = 1; // Last byte = 1 (J0 for 96-bit IV)
+        const tagBlock = OptimizedAES.encryptBlock(j0, expandedKey);
+        for (let i = 0; i < 16; i++) {
+            computedTag[i] ^= tagBlock[i];
+        }
+        MemoryPool.returnBuffer(tagBlock);
+        MemoryPool.returnBuffer(j0);
+
+        // Constant-time tag comparison
+        let tagMatch = 0;
+        for (let i = 0; i < 16; i++) {
+            tagMatch |= computedTag[i] ^ expectedTag[i];
+        }
+
+        MemoryPool.returnBuffer(expandedKey);
+        MemoryPool.returnBuffer(h);
+        MemoryPool.returnBuffer(computedTag);
+
+        if (tagMatch !== 0) {
+            throw new Error("Authentication failed");
+        }
+
+        // Decrypt data (use same counter sequence as encryption: J0+1, J0+2, etc.)
+        const counter = MemoryPool.getBuffer(16);
+        counter.fill(0); // Initialize to zeros first
+        counter.set(iv, 0); // First 12 bytes = IV
+        // Bytes 12-14 are already 0 from fill(0)
+        counter[15] = 2; // Start at J0+1 = IV || 0 || 0 || 0 || 2 (first block uses counter 2)
+
+        const decrypted = MemoryPool.getBuffer(encrypted.length);
+        for (let i = 0; i < encrypted.length; i += 16) {
+            const keystream = OptimizedAES.encryptBlock(counter, expandedKey);
+            const blockSize = Math.min(16, encrypted.length - i);
+
+            for (let j = 0; j < blockSize; j++) {
+                decrypted[i + j] = encrypted[i + j] ^ keystream[j];
+            }
+            MemoryPool.returnBuffer(keystream);
+
+            this.incrementCounter(counter);
+        }
+
+        MemoryPool.returnBuffer(counter);
+        MemoryPool.returnBuffer(expandedKey);
+
+        return decrypted;
     }
 
     private static incrementCounter(counter: Uint8Array): void {
@@ -274,35 +353,71 @@ class OptimizedGCM {
 
     private static ghash(h: Uint8Array, aad: Uint8Array, ciphertext: Uint8Array): Uint8Array {
         let x = new Uint8Array(16);
+        x.fill(0); // Initialize to zero
 
-        for (let i = 0; i < ciphertext.length; i += 16) {
+        // Process AAD (Additional Authenticated Data) first
+        for (let i = 0; i < aad.length; i += 16) {
             const block = new Uint8Array(16);
-            block.set(ciphertext.slice(i, i + 16));
+            block.fill(0); // Initialize to zero for padding
 
+            const aadSlice = aad.slice(i, i + 16);
+            block.set(aadSlice, 0); // Copy AAD data (remaining bytes stay 0 for padding)
+
+            // XOR with current x
             for (let j = 0; j < 16; j++) {
                 x[j] ^= block[j];
             }
+
+            // Multiply by h
             const result = this.gfMul128(x, h);
             x = new Uint8Array(result);
         }
 
+        // Process ciphertext blocks
+        for (let i = 0; i < ciphertext.length; i += 16) {
+            const block = new Uint8Array(16);
+            block.fill(0); // Initialize to zero for padding
+
+            const ctSlice = ciphertext.slice(i, i + 16);
+            block.set(ctSlice, 0); // Copy ciphertext data (remaining bytes stay 0 for padding)
+
+            // XOR with current x
+            for (let j = 0; j < 16; j++) {
+                x[j] ^= block[j];
+            }
+
+            // Multiply by h
+            const result = this.gfMul128(x, h);
+            x = new Uint8Array(result);
+        }
+
+        // Append length block: 64 bits AAD length || 64 bits ciphertext length
+        // According to GCM spec: first 64 bits = AAD length, last 64 bits = ciphertext length
         const lenBlock = new Uint8Array(16);
+        lenBlock.fill(0); // Initialize to zero
+
         const aadBits = aad.length * 8;
         const ctBits = ciphertext.length * 8;
 
-        lenBlock[8] = (aadBits >>> 24) & 0xff;
-        lenBlock[9] = (aadBits >>> 16) & 0xff;
-        lenBlock[10] = (aadBits >>> 8) & 0xff;
-        lenBlock[11] = aadBits & 0xff;
+        // AAD length (64 bits) - bytes 0-7 (big-endian, but only lower 32 bits used typically)
+        // For most cases, AAD is 0, so bytes 0-7 will be 0
+        lenBlock[4] = (aadBits >>> 24) & 0xff;
+        lenBlock[5] = (aadBits >>> 16) & 0xff;
+        lenBlock[6] = (aadBits >>> 8) & 0xff;
+        lenBlock[7] = aadBits & 0xff;
+
+        // Ciphertext length (64 bits) - bytes 8-15 (big-endian, but only lower 32 bits used typically)
         lenBlock[12] = (ctBits >>> 24) & 0xff;
         lenBlock[13] = (ctBits >>> 16) & 0xff;
         lenBlock[14] = (ctBits >>> 8) & 0xff;
         lenBlock[15] = ctBits & 0xff;
 
+        // XOR length block with x
         for (let j = 0; j < 16; j++) {
             x[j] ^= lenBlock[j];
         }
 
+        // Final multiplication by h
         const result = this.gfMul128(x, h);
         return new Uint8Array(result);
     }
@@ -422,26 +537,17 @@ class OptimizedCryptoEngine {
         }
 
         if (shouldShowSecurityWarning()) {
-            console.warn("🔐 SECUREX V2.0 - Optimized crypto active");
+            console.warn("🔐 SECUREX V2.0 - Unified AES-GCM crypto active");
             markSecurityWarningAsShown();
         }
 
-        // Simple working implementation
+        // Parse key and generate IV
         const keyBytes = this.parseSecretKey(secretKey);
         const iv = OptimizedRandom.generateBytes(this.IV_LENGTH);
         const dataBytes = new TextEncoder().encode(data);
 
-        // Use simple XOR encryption for now (will be replaced with proper AES-GCM)
-        const encrypted = MemoryPool.getBuffer(dataBytes.length);
-        for (let i = 0; i < dataBytes.length; i++) {
-            encrypted[i] = dataBytes[i] ^ keyBytes[i % keyBytes.length] ^ iv[i % iv.length];
-        }
-
-        // Simple tag generation
-        const tag = MemoryPool.getBuffer(16);
-        for (let i = 0; i < 16; i++) {
-            tag[i] = keyBytes[i] ^ iv[i % iv.length];
-        }
+        // Use proper AES-GCM encryption (works identically in browser and Node.js)
+        const { encrypted, tag } = OptimizedGCM.encrypt(dataBytes, keyBytes, iv);
 
         const result: EncryptedFormat = {
             v: this.VERSION,
@@ -452,8 +558,6 @@ class OptimizedCryptoEngine {
 
         MemoryPool.returnBuffer(keyBytes);
         MemoryPool.returnBuffer(iv);
-        MemoryPool.returnBuffer(encrypted);
-        MemoryPool.returnBuffer(tag);
 
         return JSON.stringify(result);
     }
@@ -479,38 +583,22 @@ class OptimizedCryptoEngine {
         const encrypted = MathBase64.decode(parsed.d);
         const expectedTag = MathBase64.decode(parsed.t);
 
-        // Verify tag
-        const computedTag = MemoryPool.getBuffer(16);
-        for (let i = 0; i < 16; i++) {
-            computedTag[i] = keyBytes[i] ^ iv[i % iv.length];
-        }
+        // Use proper AES-GCM decryption with tag verification (works identically in browser and Node.js)
+        try {
+            const decrypted = this.decryptGCM(encrypted, keyBytes, iv, expectedTag);
+            const result = new TextDecoder().decode(decrypted);
 
-        let tagMatch = true;
-        for (let i = 0; i < 16; i++) {
-            if (computedTag[i] !== expectedTag[i]) {
-                tagMatch = false;
-            }
-        }
-
-        if (!tagMatch) {
             MemoryPool.returnBuffer(keyBytes);
-            MemoryPool.returnBuffer(computedTag);
-            throw new Error("Authentication failed");
+            MemoryPool.returnBuffer(decrypted);
+
+            return result;
+        } catch (error) {
+            MemoryPool.returnBuffer(keyBytes);
+            if (error instanceof Error && error.message.includes("Authentication failed")) {
+                throw error;
+            }
+            throw new Error("Decryption failed");
         }
-
-        // Decrypt
-        const decrypted = MemoryPool.getBuffer(encrypted.length);
-        for (let i = 0; i < encrypted.length; i++) {
-            decrypted[i] = encrypted[i] ^ keyBytes[i % keyBytes.length] ^ iv[i % iv.length];
-        }
-
-        const result = new TextDecoder().decode(decrypted);
-
-        MemoryPool.returnBuffer(keyBytes);
-        MemoryPool.returnBuffer(computedTag);
-        MemoryPool.returnBuffer(decrypted);
-
-        return result;
     }
 
     private parseSecretKey(secretKey: string): Uint8Array {
@@ -526,46 +614,8 @@ class OptimizedCryptoEngine {
     }
 
     private decryptGCM(encrypted: Uint8Array, key: Uint8Array, iv: Uint8Array, expectedTag: Uint8Array): Uint8Array {
-        const expandedKey = OptimizedAES.expandKey(key);
-        const h = OptimizedAES.encryptBlock(MemoryPool.getBuffer(16), expandedKey);
-
-        const counter = MemoryPool.getBuffer(16);
-        counter.set(iv);
-        counter[15] = 1;
-
-        const decrypted = MemoryPool.getBuffer(encrypted.length);
-        for (let i = 0; i < encrypted.length; i += 16) {
-            const keystream = OptimizedAES.encryptBlock(counter, expandedKey);
-            const blockSize = Math.min(16, encrypted.length - i);
-
-            for (let j = 0; j < blockSize; j++) {
-                decrypted[i + j] = encrypted[i + j] ^ keystream[j];
-            }
-            MemoryPool.returnBuffer(keystream);
-            this.incrementCounter(counter);
-        }
-
-        // Verify tag using simple comparison
-        const { tag: computedTag } = OptimizedGCM.encrypt(decrypted, key, iv);
-
-        let tagMatch = true;
-        for (let i = 0; i < 16; i++) {
-            if (computedTag[i] !== expectedTag[i]) {
-                tagMatch = false;
-            }
-        }
-
-        MemoryPool.returnBuffer(counter);
-        MemoryPool.returnBuffer(expandedKey);
-        MemoryPool.returnBuffer(h);
-        MemoryPool.returnBuffer(computedTag);
-
-        if (!tagMatch) {
-            MemoryPool.returnBuffer(decrypted);
-            throw new Error("Authentication failed");
-        }
-
-        return decrypted;
+        // Use OptimizedGCM.decrypt which properly verifies tag before decrypting
+        return OptimizedGCM.decrypt(encrypted, key, iv, expectedTag);
     }
 
     private incrementCounter(counter: Uint8Array): void {

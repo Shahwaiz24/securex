@@ -7,6 +7,12 @@ export default {
         format: 'es',
         name: 'securex',
     },
+    external: [
+        '@noble/ciphers/aes',
+        '@noble/ciphers/webcrypto',
+        '@noble/ciphers/crypto',
+        '@noble/ciphers/utils'
+    ],
     plugins: [
         typescript({
             tsconfig: 'tsconfig.json',
