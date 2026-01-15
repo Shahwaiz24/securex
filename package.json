@@ -1,6 +1,6 @@
 {
   "name": "securex",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
@@ -29,7 +29,7 @@
   ],
   "author": "Shahwaiz Afzal <shahwaizafzal90@gmail.com> (https://github.com/Shahwaiz24)",
   "license": "ISC",
-  "description": "Military-grade AES-256-GCM encryption library for tokens and data, a secure JWT alternative",
+  "description": "AES-256-GCM encryption library for tokens and data",
   "devDependencies": {
     "@rollup/plugin-typescript": "^12.1.4",
     "@types/node": "^24.3.1",
